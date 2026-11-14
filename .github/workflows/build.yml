@@ -1,0 +1,197 @@
+name: build-fastmtp-hip
+
+# Builds upstream llama.cpp at the commit pinned by the HauhauCS FastMTP model card,
+# applies the publisher's patch, and compiles the HIP backend for RDNA4 (gfx1201)
+# on Windows. Output: a self-contained zip (exe + ROCm runtime DLLs) in a GitHub release.
+
+on:
+  push:
+    branches: [build]
+  workflow_dispatch:
+    inputs:
+      rocm_version:
+        description: "ROCm wheel version from repo.amd.com/rocm/whl-multi-arch"
+        default: "7.14.0"
+      gpu_targets:
+        description: "AMDGPU_TARGETS"
+        default: "gfx1201"
+
+permissions:
+  contents: write
+
+env:
+  LLAMA_COMMIT: 4df29be4f4c3673f428170fda944a5b19f743bb8
+  PATCH_URL: https://huggingface.co/HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF/resolve/main/HauhauCS-FastMTP-llama.cpp.patch
+  ROCM_VERSION: ${{ github.event.inputs.rocm_version || '7.14.0' }}
+  GPU_TARGETS: ${{ github.event.inputs.gpu_targets || 'gfx1201' }}
+
+jobs:
+  build:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [plain, rocwmma]
+    steps:
+      - name: Checkout llama.cpp at pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_COMMIT }}
+          path: llama.cpp
+
+      - name: Download and apply FastMTP patch
+        shell: pwsh
+        working-directory: llama.cpp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri $env:PATCH_URL -OutFile ../fastmtp.patch
+          Get-FileHash ../fastmtp.patch -Algorithm SHA256 | Format-List
+          git apply --check ../fastmtp.patch
+          git apply ../fastmtp.patch
+          git --no-pager diff --stat
+
+      - name: Install ROCm (TheRock wheels)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force C:\TheRock\build | Out-Null
+          python -m venv C:\TheRock\build\.venv
+          $py = 'C:\TheRock\build\.venv\Scripts\python.exe'
+          & $py -m pip install --upgrade pip
+          & $py -m pip install "rocm[libraries,devel]==$env:ROCM_VERSION" `
+            --index-url https://repo.amd.com/rocm/whl-multi-arch/ `
+            --extra-index-url https://pypi.org/simple
+          if ($LASTEXITCODE -ne 0) { throw "pip install rocm failed" }
+          & C:\TheRock\build\.venv\Scripts\rocm-sdk.exe init
+          if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed" }
+
+      - name: Setup ROCm environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdk  = 'C:\TheRock\build\.venv\Scripts\rocm-sdk.exe'
+          $root = (& $sdk path --root).Trim()
+          $bin  = (& $sdk path --bin).Trim()
+          Write-Host "ROCm root: $root"
+          Write-Host "ROCm bin : $bin"
+          Get-ChildItem $root | Select-Object -First 30 | Format-Table Name
+          "HIP_PATH=$root"              | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "ROCM_ROOT=$root"             | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "ROCM_BIN=$bin"               | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CMAKE_PREFIX_PATH=$root"     | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "HIP_PLATFORM=amd"            | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "LLVM_PATH=$root\lib\llvm"    | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $dl = Join-Path $root 'lib\llvm\amdgcn\bitcode'
+          if (Test-Path $dl) { "HIP_DEVICE_LIB_PATH=$dl" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV }
+          $bin                          | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "$root\lib\llvm\bin"          | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: MSVC environment (headers/libs for clang)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          ninja --version
+
+      - name: Configure
+        shell: pwsh
+        working-directory: llama.cpp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvm = ("$env:HIP_PATH\lib\llvm\bin") -replace '\\','/'
+          $rocwmma = if ('${{ matrix.variant }}' -eq 'rocwmma') { 'ON' } else { 'OFF' }
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$llvm/clang.exe" `
+            -DCMAKE_CXX_COMPILER="$llvm/clang++.exe" `
+            -DCMAKE_HIP_COMPILER="$llvm/clang++.exe" `
+            "-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types" `
+            -DGGML_HIP=ON `
+            -DGGML_HIP_ROCWMMA_FATTN=$rocwmma `
+            "-DAMDGPU_TARGETS=$env:GPU_TARGETS" `
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON `
+            -DLLAMA_CURL=OFF `
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+
+      - name: Build
+        shell: pwsh
+        working-directory: llama.cpp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+          Get-ChildItem build\bin | Format-Table Name, Length
+
+      - name: Package (exe + ROCm runtime, gfx-filtered libraries)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "pkg"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item llama.cpp\build\bin\* $out -Recurse
+          # ROCm runtime DLLs the HIP backend needs at run time
+          $patterns = 'amdhip64*.dll','amd_comgr*.dll','hipblas*.dll','hipblaslt*.dll','rocblas*.dll','rocroller*.dll','hiprtc*.dll','libhipblas*.dll','libhipblaslt*.dll'
+          foreach ($p in $patterns) {
+            Get-ChildItem $env:ROCM_BIN -Filter $p -ErrorAction SilentlyContinue | Copy-Item -Destination $out -Force
+          }
+          # kernel libraries (Tensile / hipBLASLt) - keep only the target arch + arch-neutral files
+          foreach ($d in 'rocblas','hipblaslt') {
+            $src = Join-Path $env:ROCM_BIN $d
+            if (Test-Path $src) {
+              Copy-Item $src (Join-Path $out $d) -Recurse -Force
+              Get-ChildItem (Join-Path $out $d) -Recurse -File |
+                Where-Object { $_.Name -match 'gfx\d+' -and $_.Name -notmatch ($env:GPU_TARGETS -replace ';','|') } |
+                Remove-Item -Force
+            }
+          }
+          Copy-Item llama.cpp\LICENSE $out -ErrorAction SilentlyContinue
+          @(
+            "llama.cpp commit : $env:LLAMA_COMMIT",
+            "patch sha256     : $((Get-FileHash fastmtp.patch -Algorithm SHA256).Hash)",
+            "rocm wheels      : $env:ROCM_VERSION",
+            "gpu targets      : $env:GPU_TARGETS",
+            "variant          : ${{ matrix.variant }}"
+          ) | Set-Content "$out\build-info.txt"
+          $zip = "llama-fastmtp-win-hip-${{ matrix.variant }}.zip"
+          Compress-Archive -Path "$out\*" -DestinationPath $zip -Force
+          Get-Item $zip | Format-List Name, Length
+          "ZIP_NAME=$zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Smoke test (no GPU on runner)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $env:PATH = "$((Resolve-Path pkg).Path);$env:PATH"
+          & pkg\llama-server.exe --version 2>&1 | Select-Object -First 8
+          Write-Host "---- FastMTP-relevant flags ----"
+          & pkg\llama-server.exe --help 2>&1 | Select-String -Pattern 'spec-draft|spec-type|draft-mtp|cache-type|reasoning' | Select-Object -First 40
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist
+          gh release create "build-${{ github.run_number }}" dist/*.zip \
+            --repo "${{ github.repository }}" \
+            --title "FastMTP HIP build ${{ github.run_number }}" \
+            --notes "llama.cpp ${{ env.LLAMA_COMMIT }} + HauhauCS FastMTP patch, HIP ${{ env.GPU_TARGETS }}, ROCm ${{ env.ROCM_VERSION }}"
