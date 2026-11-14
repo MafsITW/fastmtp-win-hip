@@ -140,15 +140,22 @@ jobs:
           foreach ($p in $patterns) {
             Get-ChildItem $env:ROCM_BIN -Filter $p -ErrorAction SilentlyContinue | Copy-Item -Destination $out -Force
           }
-          # kernel libraries (Tensile / hipBLASLt) - keep only the target arch + arch-neutral files
-          foreach ($d in 'rocblas','hipblaslt') {
-            $src = Join-Path $env:ROCM_BIN $d
-            if (Test-Path $src) {
-              Copy-Item $src (Join-Path $out $d) -Recurse -Force
-              Get-ChildItem (Join-Path $out $d) -Recurse -File |
-                Where-Object { $_.Name -match 'gfx\d+' -and $_.Name -notmatch ($env:GPU_TARGETS -replace ';','|') } |
-                Remove-Item -Force
-            }
+          # kernel libraries (Tensile / hipBLASLt): TheRock keeps them in separate wheels, so search
+          # the whole venv for <rocblas|hipblaslt>\library and keep only target-arch + arch-neutral files
+          $sp = 'C:\TheRock\build\.venv\Lib\site-packages'
+          $libs = Get-ChildItem $sp -Recurse -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq 'library' -and $_.Parent.Name -in 'rocblas','hipblaslt' }
+          $libs | ForEach-Object { Write-Host "found kernel lib dir: $($_.FullName)" }
+          if (-not ($libs | Where-Object { $_.Parent.Name -eq 'rocblas' })) { throw "rocblas library dir not found" }
+          $arch = ($env:GPU_TARGETS -split '[;,]') -join '|'
+          foreach ($l in $libs) {
+            $dst = Join-Path $out (Join-Path $l.Parent.Name 'library')
+            New-Item -ItemType Directory -Force $dst | Out-Null
+            Copy-Item (Join-Path $l.FullName '*') $dst -Recurse -Force
+            Get-ChildItem $dst -Recurse -File |
+              Where-Object { $_.Name -match 'gfx\d+' -and $_.Name -notmatch $arch } |
+              Remove-Item -Force
+            "{0}: {1} files, {2:N1} MB kept" -f $l.Parent.Name, (Get-ChildItem $dst -Recurse -File).Count, ((Get-ChildItem $dst -Recurse -File | Measure-Object Length -Sum).Sum/1MB) | Write-Host
           }
           Copy-Item llama.cpp\LICENSE $out -ErrorAction SilentlyContinue
           @(
