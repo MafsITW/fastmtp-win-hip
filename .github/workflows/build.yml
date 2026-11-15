@@ -60,7 +60,7 @@ jobs:
           $py = 'C:\TheRock\build\.venv\Scripts\python.exe'
           & $py -m pip install --upgrade pip
           # device wheel(s) carry the rocBLAS / hipBLASLt kernels for the target GPU(s)
-          $devPkgs = ($env:GPU_TARGETS -split '[;,]') | ForEach-Object { "rocm-sdk-device-$_==$env:ROCM_VERSION" }
+          $devPkgs = @(($env:GPU_TARGETS -split "[;,]") | ForEach-Object { "rocm-sdk-device-$_==$env:ROCM_VERSION" })
           & $py -m pip install "rocm[libraries,devel]==$env:ROCM_VERSION" @devPkgs `
             --index-url https://repo.amd.com/rocm/whl-multi-arch/ `
             --extra-index-url https://pypi.org/simple
