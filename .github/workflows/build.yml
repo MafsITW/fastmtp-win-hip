@@ -33,6 +33,10 @@ jobs:
       matrix:
         variant: [plain, rocwmma]
     steps:
+      - name: Checkout helper scripts
+        uses: actions/checkout@v4
+        with:
+          path: self
       - name: Checkout llama.cpp at pinned commit
         uses: actions/checkout@v4
         with:
@@ -114,6 +118,7 @@ jobs:
             -DCMAKE_HIP_COMPILER="$llvm/clang++.exe" `
             "-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types" `
             -DGGML_HIP=ON `
+            -DGGML_OPENMP=OFF `
             -DGGML_HIP_ROCWMMA_FATTN=$rocwmma `
             "-DAMDGPU_TARGETS=$env:GPU_TARGETS" `
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON `
@@ -147,7 +152,7 @@ jobs:
           if ($omp) { Copy-Item $omp.FullName $out -Force; Write-Host "bundled $($omp.FullName)" } else { Write-Host "WARNING: libomp140 not found" }
           # transitive closure of imported DLLs available in the ROCm bin dir
           python -m pip install pefile | Out-Null
-          python (Join-Path $env:GITHUB_WORKSPACE 'scripts/closure.py') $out $env:ROCM_BIN
+          python (Join-Path $env:GITHUB_WORKSPACE 'self/scripts/closure.py') $out $env:ROCM_BIN
           # kernel libraries (Tensile / hipBLASLt): TheRock keeps them in separate wheels, so search
           # the whole venv for <rocblas|hipblaslt>\library and keep only target-arch + arch-neutral files
           $sp = 'C:\TheRock\build\.venv\Lib\site-packages'
