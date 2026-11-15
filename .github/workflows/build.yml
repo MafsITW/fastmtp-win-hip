@@ -142,6 +142,33 @@ jobs:
           foreach ($p in $patterns) {
             Get-ChildItem $env:ROCM_BIN -Filter $p -ErrorAction SilentlyContinue | Copy-Item -Destination $out -Force
           }
+          # OpenMP runtime from the MSVC toolset (ggml-cpu imports libomp140.x86_64.dll)
+          $omp = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio','C:\Program Files (x86)\Microsoft Visual Studio' -Recurse -Filter 'libomp140.x86_64.dll' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'debug' } | Select-Object -First 1
+          if ($omp) { Copy-Item $omp.FullName $out -Force; Write-Host "bundled $($omp.FullName)" } else { Write-Host "WARNING: libomp140 not found" }
+          # transitive closure of imported DLLs available in the ROCm bin dir
+          python -m pip install pefile | Out-Null
+          $closure = @'
+import pefile,os,sys,shutil
+out,src=sys.argv[1],sys.argv[2]
+sysd=os.path.join(os.environ.get('WINDIR','C:\\Windows'),'System32')
+changed=True
+while changed:
+    changed=False
+    have={f.lower() for f in os.listdir(out)}
+    for f in list(os.listdir(out)):
+        if not f.lower().endswith(('.dll','.exe')): continue
+        pe=pefile.PE(os.path.join(out,f),fast_load=True)
+        pe.parse_data_directories([pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+        for e in getattr(pe,'DIRECTORY_ENTRY_IMPORT',[]):
+            n=e.dll.decode().lower()
+            if n in have or n.startswith('api-ms-') or os.path.exists(os.path.join(sysd,n)): continue
+            cand=[x for x in os.listdir(src) if x.lower()==n]
+            if cand:
+                shutil.copy(os.path.join(src,cand[0]),out); print('closure copied',cand[0]); changed=True; have.add(n)
+            else: print('UNRESOLVED',n,'needed by',f)
+'@
+          Set-Content closure.py $closure
+          python closure.py $out $env:ROCM_BIN
           # kernel libraries (Tensile / hipBLASLt): TheRock keeps them in separate wheels, so search
           # the whole venv for <rocblas|hipblaslt>\library and keep only target-arch + arch-neutral files
           $sp = 'C:\TheRock\build\.venv\Lib\site-packages'
