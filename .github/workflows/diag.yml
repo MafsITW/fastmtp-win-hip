@@ -9,24 +9,26 @@ jobs:
       - shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
+          Write-Host "==== index: device packages ===="
+          $html = (Invoke-WebRequest https://repo.amd.com/rocm/whl-multi-arch/ -UseBasicParsing).Content
+          [regex]::Matches($html, 'href="([^"]*)"') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -match 'device|gfx|rocm' } | Select-Object -First 40
           python -m venv C:\TheRock\build\.venv
           $py = 'C:\TheRock\build\.venv\Scripts\python.exe'
           & $py -m pip install --upgrade pip | Out-Null
-          & $py -m pip install "rocm[libraries,devel]==7.14.0" --index-url https://repo.amd.com/rocm/whl-multi-arch/ --extra-index-url https://pypi.org/simple 2>&1 | Select-Object -Last 5
-          Write-Host "==== pip list (rocm) ===="
-          & $py -m pip list 2>&1 | Select-String -Pattern 'rocm|amd|hip'
+          foreach ($pkg in 'rocm-sdk-device-gfx1201','rocm-sdk-device-gfx120x-all','rocm-sdk-device-gfx120X-all','rocm-sdk-device-gfx120x') {
+            Write-Host "---- try $pkg ----"
+            & $py -m pip install "rocm[libraries,devel]==7.14.0" "$pkg==7.14.0" --index-url https://repo.amd.com/rocm/whl-multi-arch/ --extra-index-url https://pypi.org/simple 2>&1 | Select-Object -Last 3
+            if ($LASTEXITCODE -eq 0) { Write-Host "INSTALLED $pkg"; break }
+          }
+          & $py -m pip list 2>&1 | Select-String -Pattern 'rocm'
           & C:\TheRock\build\.venv\Scripts\rocm-sdk.exe init
-          Write-Host "==== rocm-sdk --help ===="
-          & C:\TheRock\build\.venv\Scripts\rocm-sdk.exe --help 2>&1 | Select-Object -First 30
-          Write-Host "==== rocm-sdk targets ===="
-          & C:\TheRock\build\.venv\Scripts\rocm-sdk.exe targets 2>&1 | Select-Object -First 20
           $sp = 'C:\TheRock\build\.venv\Lib\site-packages'
-          Write-Host "==== site-packages top-level dirs ===="
-          Get-ChildItem $sp -Directory | Where-Object { $_.Name -match 'rocm|amd|hip' } | ForEach-Object { "{0}  ({1:N0} MB)" -f $_.Name, ((Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum/1MB) }
-          Write-Host "==== files matching Tensile / gfx1201 (first 40) ===="
-          Get-ChildItem $sp -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'Tensile|gfx1201|gfx120' } | Select-Object -First 40 | ForEach-Object { $_.FullName.Replace($sp,'') }
-          Write-Host "==== dirs named library / rocblas / hipblaslt ===="
-          Get-ChildItem $sp -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -in 'library','rocblas','hipblaslt' } | ForEach-Object { $_.FullName.Replace($sp,'') }
-          Write-Host "==== dlls in rocm-sdk path --bin ===="
+          Write-Host "==== site-packages rocm dirs ===="
+          Get-ChildItem $sp -Directory | Where-Object { $_.Name -match '^_rocm' } | ForEach-Object { "{0}  ({1:N0} MB)" -f $_.Name, ((Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum/1MB) }
+          Write-Host "==== dirs named library under rocblas/hipblaslt ===="
+          Get-ChildItem $sp -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'library' } | ForEach-Object { $_.FullName.Replace($sp,'') }
+          Write-Host "==== sample kernel files ===="
+          Get-ChildItem $sp -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'TensileLibrary|gfx1201' } | Select-Object -First 15 | ForEach-Object { $_.FullName.Replace($sp,'') }
           $bin = (& C:\TheRock\build\.venv\Scripts\rocm-sdk.exe path --bin).Trim()
-          Get-ChildItem $bin -Filter *.dll | Where-Object { $_.Name -match 'rocblas|hipblas|amdhip|comgr' } | ForEach-Object { "{0} {1:N1}MB" -f $_.Name, ($_.Length/1MB) }
+          Write-Host "bin: $bin"
+          Get-ChildItem $bin -Directory | ForEach-Object { "bin subdir: " + $_.Name }
